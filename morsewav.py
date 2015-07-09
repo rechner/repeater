@@ -200,7 +200,7 @@ def generate(filename, message, morse_freq_hz=DEF_MORSE_FREQ,
 		sample_rate=DEF_SAMPLE_RATE, amplitude=DEF_AMPLITUDE,
 		words_per_min=DEF_WORDS_PER_MIN,
 		letter_spacing=DEF_LETTER_SPACING):
-	
+	import pdb; pdb.set_trace()	
 	dev = filewave.open(filename, 'w')
 
 	# Set file/dev sample rate & parameters

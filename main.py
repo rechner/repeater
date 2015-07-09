@@ -7,11 +7,12 @@ import time
 import tempfile
 import ConfigParser
 import json
-#import RPi.GPIO as GPIO
+import RPi.GPIO as GPIO
 
 import festival
 import morsewav
 import pygame
+from pygame.locals import *
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 
@@ -37,6 +38,7 @@ config.read('repeater.cfg')
 DEBUG = config.getboolean('repeater', 'debug')
 COR_DIRECTION = config.get('repeater', 'cor-direction')
 CALLSIGN = config.get('repeater', 'callsign')
+ID_PERIOD = config.getint('repeater', 'id-period')
 CW_SPEED = config.get('repeater', 'cw-speed')
 CW_FREQUENCY = config.get('repeater', 'cw-frequency')
 VOICE_ID_ENABLED = config.getboolean('repeater', 'voice-id')
@@ -58,11 +60,16 @@ courtesy_tone = None
 
 # We use pygame for the sound mixer, timing functions, and event system
 pygame.mixer.init()
+pygame.init()
 
 # Generate and cache the audio files:
 fd, cw_id_file = tempfile.mkstemp()
 os.close(fd)
-morsewav.generate(cw_id_file, CALLSIGN)
+# FIXME: Why did this stop working? Worked on my laptop?
+#morsewav.generate(cw_id_file, CALLSIGN)
+import subprocess
+subprocess.call(['python', 'morsewav.py', '-a', '15000', '-o', cw_id_file, CALLSIGN])
+
 cw_id = pygame.mixer.Sound(cw_id_file)
 
 if os.path.exists(COURTESY_TONE_FILE): 
@@ -78,16 +85,210 @@ else:
     cleanup()
     exit()
 
+Repeater_enabled = True  # Disabled during time-out conditions
+PTT_state = 0
+PTT_timer = -1
+PTT_recovery_timer = -1
+PTT_hanging = False  # True when COR is inactive but repeater is still keyed up
+ID_wait_flag = False # Set when the repeater gets used and reset after ID'ing
+Last_ID_time = -1 # UNIX timestamp of last time repeater ID'ed
+
+# Set up the GPIO's (BCM pinout):
+COR_PIN = 27
+PTT_PIN = 22
+POWER_SENSE_PIN = 16
+RX_MUTE_PIN = 24
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PTT_PIN, GPIO.OUT)
+GPIO.setup(RX_MUTE_PIN, GPIO.OUT)
+GPIO.setup(COR_PIN, GPIO.IN, GPIO.PUD_UP)
+GPIO.setup(POWER_SENSE_PIN, GPIO.IN, GPIO.PUD_UP)
+
+GPIO.output(PTT_PIN, 0)
+GPIO.output(RX_MUTE_PIN, 0)
+
+# PyGame events:
+TIMEOUT_TIMER_EVENT = USEREVENT+1
+TIMEOUT_RECOVERY_EVENT = USEREVENT+2
+HANGTIME_RELEASE_PTT_EVENT = USEREVENT+3
+CW_ID_EVENT = USEREVENT+4
+
 def main():
+    global PTT_timer
+    global Repeater_enabled
+
+    global PTT_state
+    global PTT_timer
+    global PTT_recovery_timer
+    global ID_wait_flag
+    global PTT_hanging
+
+    print "Repeater started"
+    courtesy_tone.play()
+
     # Event loop
     while True:
-        for event in pygame.event.get():
-            pass
+        for event in pygame.event.get(): 
+            if event.type == TIMEOUT_RECOVERY_EVENT:
+                # Check that noone is transmitting
+                if GPIO.input(COR_PIN) == 1:
+                    pygame.time.set_timer(TIMEOUT_RECOVERY_EVENT, 0)
+                    print "Timeout cleared"
+                    ptt(True)
+                    festival.say("Time out clear") 
+                    if not check_id_period():
+                        ptt(False)
+                    Repeater_enabled = True
+                else:
+                    print "WARN: COR still active, skipping until fault is cleared"
+
+            # Skip the rest of event processing if repeater is timed-out
+            if not Repeater_enabled:
+                continue
+            # Events below here are repeater-only 
+            # and can be disabled under certain conditions.
+            # ============================================
+
+            # Timing events fire once per second (1000 ms)
+            if event.type == TIMEOUT_TIMER_EVENT:
+                PTT_timer -= 1
+
+            if event.type == HANGTIME_RELEASE_PTT_EVENT:
+                pygame.time.set_timer(HANGTIME_RELEASE_PTT_EVENT, 0)
+                PTT_hanging = False
+                ptt(False)
+            if event.type == CW_ID_EVENT:
+                if DEBUG: print "CW_ID_EVENT triggered"
+                pygame.time.set_timer(CW_ID_EVENT, 0)
+                # Only play courtesy tone and release if no RX
+                if GPIO.input(COR_PIN) == 1:
+                    if DEBUG: print "COR is inactive, playing courtesy tone"
+                    courtesy_tone.play()
+                    pygame.time.delay(int(courtesy_tone.get_length()) * 1000)
+                    # Set hangtime and event to disable PTT:
+                    pygame.time.set_timer(HANGTIME_RELEASE_PTT_EVENT, HANGTIME*1000)
+
+        COR_State = GPIO.input(COR_PIN)
+
+        if Repeater_enabled:
+            if COR_State == 0 and not PTT_state: # Active low after JFET
+                if DEBUG: print "RX active, start TOT timer"
+                # Engage PTT
+                ptt(True)
+                PTT_hanging = False
+
+                # Start TOT timer
+                PTT_timer = TIMEOUT_TIMER
+                pygame.time.set_timer(TIMEOUT_TIMER_EVENT, 1000)
+
+                # Reset activity flag
+                ID_wait_flag = True
+
+            # User has stopped transmitting:
+            if COR_State == 1 and PTT_state and not PTT_hanging:
+                if DEBUG: print "RX release, TOT timer reset: {0}s was remaining".format(PTT_timer)
+                PTT_hanging = True
+
+                # Stop TOT timer event and reset timer
+                pygame.time.set_timer(TIMEOUT_TIMER_EVENT, 0)
+                PTT_timer = -1
+
+                # Polite CW-ID if needed
+                ID_played = check_id_period()
+                if not ID_played:
+                    # Play courtesy tone (otherwise set in CW_ID_EVENT)
+                    courtesy_tone.play()
+                    # Block for courtesy tone duration
+                    pygame.time.delay(int(courtesy_tone.get_length()) * 1000)
+
+                    # Set timer for hangtime duration and to release PTT
+                    pygame.time.set_timer(HANGTIME_RELEASE_PTT_EVENT, HANGTIME*1000)
+                    
+
+            if PTT_timer == 0:
+                # Stop the TOT timer event and reset timer
+                pygame.time.set_timer(TIMEOUT_TIMER_EVENT, 0)
+                PTT_timer = -1
+
+                # Mute RX audio and play time-out message
+                RX_audio_enable(False)
+                festival.say("Time out")
+                RX_audio_enable(True)
+
+                # Release PTT
+                ptt(False)
+
+                # Start time-out recovery timer
+                pygame.time.set_timer(TIMEOUT_RECOVERY_EVENT, TIMEOUT_DURATION*1000)
+
+                # Disable repeater
+                Repeater_enabled = False
+
+            if COR_State == 1 and not PTT_state and not PTT_hanging:
+                check_id_period()
+
+        #pygame.time.tick(30)
+        pygame.time.delay(100)
+
 
 # The with PTT() while nice, is blocking and won't work if we want to stop a 
 # voice ID and replace it with a CW-ID.  Instead we can make an event that carries
 # the PTT release time and just keep putting it back in the event queue until that
 # time is reached.
+
+def ptt(state):
+    assert type(state) is bool, "parameter must be boolean type"
+    global PTT_state
+    PTT_state = state
+    GPIO.output(PTT_PIN, state)
+
+# Mute or unmute the incoming RX audio
+def RX_audio_enable(state):
+    assert type(state) is bool, "parameter must be boolean type"
+    GPIO.output(RX_MUTE_PIN, not state)
+
+def check_id_period():
+    global Last_ID_time
+    global ID_wait_flag
+    now = time.time()
+    if (now - ID_PERIOD) >= Last_ID_time:
+        if DEBUG: print "ID period exceeded, last ID was {0}".format( Last_ID_time)
+        # ID period exceeded, we probably need to do it.
+        # Assert PTT if needed
+        old_PTT_state = PTT_state
+        if PTT_state == False:
+            ptt(True)
+
+        # Has the repeater been used since the last ID?
+        if ID_wait_flag:
+            # Use a polite CW-id
+            cw_id.play()
+
+            # Wait for ID to play and release PTT if needed:
+            if old_PTT_state:
+                # Let caller handle courtesy tone and PTT
+                pygame.time.set_timer(CW_ID_EVENT, (int(cw_id.get_length()+1) * 1000))
+            else:
+                # This is a tail ID: block for duration and stop TX
+                pygame.time.delay(int(cw_id.get_length()+HANGTIME) * 1000)
+                ptt(False)
+        else:
+            # Use a short voice ID This blocks so we can't interrupt it
+            festival.say(CALLSIGN)  # Maybe cache to .wav instead?
+
+            # Release PTT if needed:
+            if not old_PTT_state:
+                ptt(False)
+        
+        # Reset ID flag and timestamp
+        ID_wait_flag = False
+        Last_ID_time = now
+
+        return True
+    return False
+        
+
 def voiceid():
     # NOTE: festival.say() blocks, but pygame sounds do not
     with PTT():
@@ -99,7 +300,9 @@ def voiceid():
        pygame.time.delay(int((courtesy_tone.get_length() + HANGTIME) * 1000))
 
 def saytime():
-    festival.say(getTimeString())
+    time_string = getTimeString()
+    if DEBUG: print "TTS: " + time_string
+    festival.say(time_string)
 
 def getTimeString():
     # Format time in a way the TTS engine understands better
@@ -117,11 +320,13 @@ def getTimeString():
     if minute == 0:
         return "The time is {0} hours {1}".format(hour, timezone)
     else:
-        return "The time is {0} {1} {2}".format(hour, minute, timezone)
+        return "The time is {0}:{1} {2}".format(hour, minute, timezone)
 
 def cleanup():
     # Cleanup temporary files
     os.unlink(cw_id_file)
+    ptt(False)
+    GPIO.cleanup()
 
 class PTT(object):
     def __init__(self):
@@ -129,11 +334,20 @@ class PTT(object):
 
     def __enter__(self):
         if DEBUG: print("Debug: PTT on")
-        # FIXME Engage PTT here
+        GPIO.output(PTT_PIN, 1)
+	    
 
     def __exit__(self, *excinfo):
         if DEBUG: print("Debug: PTT off")
-        # FIXME Disengage PTT here
+        GPIO.output(PTT_PIN, 0)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        cleanup()
+        exit()
+    #voiceid()
+    #saytime()
+    cleanup()
+    exit()
