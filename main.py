@@ -8,6 +8,8 @@ import tempfile
 import ConfigParser
 import json
 import RPi.GPIO as GPIO
+import subprocess
+from fcntl import fcntl, FGETFL, F_SETFL
 
 import festival
 import morsewav
@@ -72,10 +74,10 @@ subprocess.call(['python', 'morsewav.py', '-a', '15000', '-o', cw_id_file, CALLS
 
 cw_id = pygame.mixer.Sound(cw_id_file)
 
-if os.path.exists(COURTESY_TONE_FILE): 
+if os.path.exists(COURTESY_TONE_FILE):
     courtesy_tone = pygame.mixer.Sound(COURTESY_TONE_FILE)
 elif os.path.exists('sounds/Beep.wav'):
-    print("Warn: Courtesy tone file {0} not found, using Beep.wav instead" 
+    print("Warn: Courtesy tone file {0} not found, using Beep.wav instead"
       .format(COURTESY_TONE_FILE))
     courtesy_tone = pygame.mixer.Sound('sounds/Beep.wav')
 else:
@@ -129,14 +131,14 @@ def main():
 
     # Event loop
     while True:
-        for event in pygame.event.get(): 
+        for event in pygame.event.get():
             if event.type == TIMEOUT_RECOVERY_EVENT:
                 # Check that noone is transmitting
                 if GPIO.input(COR_PIN) == 1:
                     pygame.time.set_timer(TIMEOUT_RECOVERY_EVENT, 0)
                     print "Timeout cleared"
                     ptt(True)
-                    festival.say("Time out clear") 
+                    festival.say("Time out clear")
                     if not check_id_period():
                         ptt(False)
                     Repeater_enabled = True
@@ -146,7 +148,7 @@ def main():
             # Skip the rest of event processing if repeater is timed-out
             if not Repeater_enabled:
                 continue
-            # Events below here are repeater-only 
+            # Events below here are repeater-only
             # and can be disabled under certain conditions.
             # ============================================
 
@@ -204,7 +206,7 @@ def main():
 
                     # Set timer for hangtime duration and to release PTT
                     pygame.time.set_timer(HANGTIME_RELEASE_PTT_EVENT, HANGTIME*1000)
-                    
+
 
             if PTT_timer == 0:
                 # Stop the TOT timer event and reset timer
@@ -231,8 +233,7 @@ def main():
         #pygame.time.tick(30)
         pygame.time.delay(100)
 
-
-# The with PTT() while nice, is blocking and won't work if we want to stop a 
+# The with PTT() while nice, is blocking and won't work if we want to stop a
 # voice ID and replace it with a CW-ID.  Instead we can make an event that carries
 # the PTT release time and just keep putting it back in the event queue until that
 # time is reached.
@@ -280,14 +281,14 @@ def check_id_period():
             # Release PTT if needed:
             if not old_PTT_state:
                 ptt(False)
-        
+
         # Reset ID flag and timestamp
         ID_wait_flag = False
         Last_ID_time = now
 
         return True
     return False
-        
+
 
 def voiceid():
     # NOTE: festival.say() blocks, but pygame sounds do not
@@ -309,7 +310,7 @@ def getTimeString():
     now = time.localtime()
     hour = now[3]
     minute = now[4]
-    
+
     # Append timezone
     try:
         timezone = TIMEZONE_TAB[time.tzname[time.daylight]]
@@ -321,6 +322,13 @@ def getTimeString():
         return "The time is {0} hours {1}".format(hour, timezone)
     else:
         return "The time is {0}:{1} {2}".format(hour, minute, timezone)
+
+def setup_multimon():
+    # Create FIFO
+    # Run aplay to fill FIFO with PCM sound from the soundcard
+    # Start multimon in a non-blocking fashion
+    # (Consult http://eyalarubas.com/python-subproc-nonblock.html)
+    pass
 
 def cleanup():
     # Cleanup temporary files
@@ -335,7 +343,7 @@ class PTT(object):
     def __enter__(self):
         if DEBUG: print("Debug: PTT on")
         GPIO.output(PTT_PIN, 1)
-	    
+
 
     def __exit__(self, *excinfo):
         if DEBUG: print("Debug: PTT off")
