@@ -9,7 +9,7 @@ import ConfigParser
 import json
 import RPi.GPIO as GPIO
 import subprocess
-from fcntl import fcntl, FGETFL, F_SETFL
+from fcntl import fcntl, F_GETFL, F_SETFL
 
 import festival
 import morsewav
@@ -115,6 +115,8 @@ TIMEOUT_TIMER_EVENT = USEREVENT+1
 TIMEOUT_RECOVERY_EVENT = USEREVENT+2
 HANGTIME_RELEASE_PTT_EVENT = USEREVENT+3
 CW_ID_EVENT = USEREVENT+4
+
+multimon_process = None
 
 def main():
     global PTT_timer
@@ -324,11 +326,27 @@ def getTimeString():
         return "The time is {0}:{1} {2}".format(hour, minute, timezone)
 
 def setup_multimon():
+	global miutimon_process
+	
     # Create FIFO
+    handle, audio_fifo = tempfile.mkstemp()
+    os.mkfifo(audio_fifo)
+    handle.close()
+    
     # Run aplay to fill FIFO with PCM sound from the soundcard
+    subprocess.Popen("arecord -r 22050 -t wav > {0}".format(audio_fifo), shell=True)
+    
     # Start multimon in a non-blocking fashion
     # (Consult http://eyalarubas.com/python-subproc-nonblock.html)
-    pass
+    multimon_process = subprocess.Popen(["multimon-ng", "-a", "DTMF", "-t", "wav", audio_fifo], 
+		shell=False,
+		stdin = subprocess.PIPE,
+		stdout = subprocess.PIPE,
+		stderr = subrpocess.PIPE)
+		
+	flags = fcntl(multimon_process.stdout,F_GETFL)
+	fcntl(multimon_process.stdout,F_SETFL,flags|os.O_NONBLOCK)
+    
 
 def cleanup():
     # Cleanup temporary files
