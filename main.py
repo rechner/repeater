@@ -15,6 +15,7 @@ import festival
 import morsewav
 import pygame
 from pygame.locals import *
+import pyotp
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 
@@ -76,6 +77,8 @@ cw_id = pygame.mixer.Sound(cw_id_file)
 
 if os.path.exists(COURTESY_TONE_FILE):
     courtesy_tone = pygame.mixer.Sound(COURTESY_TONE_FILE)
+    repeater_down_tone = pygame.mixer.Sound('sounds/3down.wav')
+    repeater_up_tone = pygame.mixer.Sound('sounds/3up.wav')
 elif os.path.exists('sounds/Beep.wav'):
     print("Warn: Courtesy tone file {0} not found, using Beep.wav instead"
       .format(COURTESY_TONE_FILE))
@@ -98,17 +101,20 @@ Last_ID_time = -1 # UNIX timestamp of last time repeater ID'ed
 # Set up the GPIO's (BCM pinout):
 COR_PIN = 27
 PTT_PIN = 22
+RICK_KNOCKDOWN_PIN = 17
 POWER_SENSE_PIN = 16
 RX_MUTE_PIN = 24
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(PTT_PIN, GPIO.OUT)
 GPIO.setup(RX_MUTE_PIN, GPIO.OUT)
+GPIO.setup(RICK_KNOCKDOWN_PIN, GPIO.OUT)
 GPIO.setup(COR_PIN, GPIO.IN, GPIO.PUD_UP)
 GPIO.setup(POWER_SENSE_PIN, GPIO.IN, GPIO.PUD_UP)
 
 GPIO.output(PTT_PIN, 0)
 GPIO.output(RX_MUTE_PIN, 0)
+GPIO.output(RICK_KNOCKDOWN_PIN, 0)
 
 # PyGame events:
 TIMEOUT_TIMER_EVENT = USEREVENT+1
@@ -117,6 +123,7 @@ HANGTIME_RELEASE_PTT_EVENT = USEREVENT+3
 CW_ID_EVENT = USEREVENT+4
 
 multimon_process = None
+dtmf_queue = []
 
 def main():
     global PTT_timer
@@ -127,6 +134,10 @@ def main():
     global PTT_recovery_timer
     global ID_wait_flag
     global PTT_hanging
+    global dtmf_queue
+    
+    setup_multimon()
+    totp = pyotp.TOTP('5ZEAFI6HRJZOQ52T')
 
     print "Repeater started"
     courtesy_tone.play()
@@ -233,6 +244,30 @@ def main():
                 check_id_period()
 
         #pygame.time.tick(30)
+        dtmf_digits = process_dtmf()
+        if dtmf_digits is not None:
+            dtmf_queue.extend(dtmf_digits)
+
+        if ''.join(dtmf_queue[-8:]) == '**{0}'.format(totp.now()):
+            print "Access code entered correctly"
+            dtmf_queue = []
+
+            # Toggle repeater state
+            ptt(True)
+            if Repeater_enabled: 
+                festival.say(CALLSIGN + " REPEATER DISABLED")
+                repeater_down_tone.play()
+                pygame.time.delay(int((repeater_down_tone.get_length()) * 1000))
+                Repeater_enabled = False
+            else:
+                festival.say(CALLSIGN + " REPEATER ENABLED")
+                repeater_up_tone.play()
+                pygame.time.delay(int((repeater_up_tone.get_length()) * 1000))
+                Repeater_enabled = True
+                
+            ptt(False)
+
+        print dtmf_queue
         pygame.time.delay(100)
 
 # The with PTT() while nice, is blocking and won't work if we want to stop a
@@ -326,12 +361,12 @@ def getTimeString():
         return "The time is {0}:{1} {2}".format(hour, minute, timezone)
 
 def setup_multimon():
-	global miutimon_process
+    global multimon_process
+    global audio_fifo
 	
     # Create FIFO
-    handle, audio_fifo = tempfile.mkstemp()
+    audio_fifo = '/tmp/repeater_audio.fifo'
     os.mkfifo(audio_fifo)
-    handle.close()
     
     # Run aplay to fill FIFO with PCM sound from the soundcard
     subprocess.Popen("arecord -r 22050 -t wav > {0}".format(audio_fifo), shell=True)
@@ -339,18 +374,42 @@ def setup_multimon():
     # Start multimon in a non-blocking fashion
     # (Consult http://eyalarubas.com/python-subproc-nonblock.html)
     multimon_process = subprocess.Popen(["multimon-ng", "-a", "DTMF", "-t", "wav", audio_fifo], 
-		shell=False,
-		stdin = subprocess.PIPE,
-		stdout = subprocess.PIPE,
-		stderr = subrpocess.PIPE)
+        shell=False,
+        stdin = subprocess.PIPE,
+        stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE)
 		
-	flags = fcntl(multimon_process.stdout,F_GETFL)
-	fcntl(multimon_process.stdout,F_SETFL,flags|os.O_NONBLOCK)
-    
+    flags = fcntl(multimon_process.stdout,F_GETFL)
+    fcntl(multimon_process.stdout,F_SETFL,flags|os.O_NONBLOCK)
+
+def process_dtmf():
+    # Fetch any decoded values from the multimon process:
+    raw_out = None
+    try:
+        raw_out = os.read(multimon_process.stdout.fileno(), 1024)
+    except OSError as e:
+        #print "WARN: No more data from multimon"
+        #print e
+        return None
+
+    digits = []
+    if raw_out is not None:
+        # Parse the decoded digits
+        lines = raw_out.split('\n')
+        for packet in lines:
+            # Grab each line
+            if packet[0:6] == 'DTMF: ':
+                digits.append(packet[6])
+
+    return digits
+
 
 def cleanup():
     # Cleanup temporary files
     os.unlink(cw_id_file)
+    multimon_process.kill()
+    multimon_process.wait()
+    os.unlink(audio_fifo)
     ptt(False)
     GPIO.cleanup()
 
